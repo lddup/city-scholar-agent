@@ -129,11 +129,13 @@ def parse_pdf_file(pdf_path: str | Path) -> ParsedDocument:
 
         page_text = normalize_text(raw_text)
         if text_segments and page_text:
+            # 页与页之间在 full_text 中插入两个换行，对应字符偏移也要同步前移。
             current_char += 2
 
         start_char = current_char
         if page_text:
             text_segments.append(page_text)
+            # 记录当前页文本写入后的字符末端位置，供后续页码定位使用。
             current_char += len(page_text)
         end_char = current_char
 
@@ -185,6 +187,7 @@ def parse_pdf_files(
         try:
             documents.append(parse_pdf_file(current_path))
         except Exception as exc:
+            # 单个文件失败不影响批量任务，统一落到 errors 供上层提示用户。
             errors.append(
                 {
                     "file_name": current_path.name,
@@ -235,3 +238,4 @@ def run_parser_demo() -> None:
 
 if __name__ == "__main__":
     run_parser_demo()
+

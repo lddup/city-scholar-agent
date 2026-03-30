@@ -99,6 +99,7 @@ def split_document(
     chunks: list[TextChunk] = []
     start_char = 0
     chunk_index = 0
+    # 步长由「块大小 - 重叠长度」决定，保证相邻块有上下文交集。
     step = chunk_size - chunk_overlap
 
     while start_char < len(full_text):
@@ -106,6 +107,7 @@ def split_document(
         chunk_text = full_text[start_char:end_char].strip()
 
         if chunk_text:
+            # 每个块都携带字符区间和页码，便于问答时展示来源依据。
             chunks.append(
                 TextChunk(
                     chunk_id=f"{document.document_id}_chunk_{chunk_index:04d}",
@@ -178,6 +180,7 @@ def build_knowledge_base_records(
 
     all_chunks: list[TextChunk] = []
     for document in documents:
+        # 多篇论文统一切块后再转记录，形成一个可直接检索的扁平库。
         all_chunks.extend(split_document(document, chunk_size, chunk_overlap))
     return build_chunk_records(all_chunks)
 
@@ -221,3 +224,4 @@ def run_splitter_demo() -> None:
 
 if __name__ == "__main__":
     run_splitter_demo()
+

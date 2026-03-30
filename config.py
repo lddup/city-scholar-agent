@@ -20,6 +20,7 @@ DASHSCOPE_BASE_URL = os.getenv(
 # 按场景分配模型：问答优先性价比，结构化分析优先准确性。
 DASHSCOPE_ANSWER_MODEL = os.getenv("DASHSCOPE_ANSWER_MODEL", "qwen-plus").strip()
 DASHSCOPE_ANALYSIS_MODEL = os.getenv("DASHSCOPE_ANALYSIS_MODEL", "qwen-max").strip()
+DASHSCOPE_EMBEDDING_MODEL = os.getenv("DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v3").strip()
 
 
 def _read_int_env(name: str, default_value: int) -> int:
@@ -35,6 +36,7 @@ def _read_int_env(name: str, default_value: int) -> int:
 
 
 DASHSCOPE_TIMEOUT_SEC = _read_int_env("DASHSCOPE_TIMEOUT_SEC", 45)
+DASHSCOPE_EMBEDDING_DIMENSIONS = _read_int_env("DASHSCOPE_EMBEDDING_DIMENSIONS", 128)
 
 
 def get_app_config() -> dict[str, Path | str | int | bool]:
@@ -59,6 +61,8 @@ def get_app_config() -> dict[str, Path | str | int | bool]:
         "dashscope_base_url": DASHSCOPE_BASE_URL,
         "dashscope_answer_model": DASHSCOPE_ANSWER_MODEL,
         "dashscope_analysis_model": DASHSCOPE_ANALYSIS_MODEL,
+        "dashscope_embedding_model": DASHSCOPE_EMBEDDING_MODEL,
+        "dashscope_embedding_dimensions": DASHSCOPE_EMBEDDING_DIMENSIONS,
         "dashscope_timeout_sec": DASHSCOPE_TIMEOUT_SEC,
         "llm_enabled": bool(DASHSCOPE_API_KEY),
     }

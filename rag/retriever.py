@@ -1,5 +1,6 @@
-﻿"""本模块作用：在整个智能体中负责基于论文切块结果执行最小检索，并返回可供问答使用的相关片段。"""
+"""本模块作用：在整个智能体中负责基于论文切块结果执行最小检索，并返回可供问答使用的相关片段。"""
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -113,6 +114,7 @@ def extract_search_terms(text: str) -> list[str]:
     for phrase in chinese_phrases:
         if phrase not in COMMON_STOP_WORDS:
             terms.append(phrase)
+        # 额外生成 2/3 字切分词，提升中文短问句下的基础召回率。
         if len(phrase) >= 2:
             for index in range(len(phrase) - 1):
                 bigram = phrase[index : index + 2]
@@ -173,6 +175,7 @@ def calculate_chunk_score(
         else:
             term_weight = 1.1
 
+        # 文本命中与文件名命中分别计分，避免仅靠文件名产生过高分。
         score += min(text_count, 3) * term_weight
         score += min(name_count, 2) * (term_weight + 0.3)
 
@@ -264,6 +267,109 @@ def retrieve_relevant_chunks(
                 text=chunk_text,
                 snippet=build_chunk_snippet(chunk_text, matched_terms),
                 score=score,
+                matched_terms=matched_terms,
+                metadata=metadata,
+            )
+        )
+
+    # 分数相同场景下，按文件名和块序号稳定排序，便于复现与调试。
+    scored_chunks.sort(
+        key=lambda item: (
+            -item.score,
+            str(item.metadata.get("file_name", "")),
+            int(item.metadata.get("chunk_index", 0)),
+        )
+    )
+    return scored_chunks[:top_k]
+
+
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+    """计算两个向量的余弦相似度。
+
+    输入：
+        vector_a: 第一个向量。
+        vector_b: 第二个向量。
+    输出：
+        余弦相似度分数。
+    异常：
+        无。
+    """
+
+    if not vector_a or not vector_b or len(vector_a) != len(vector_b):
+        return 0.0
+
+    dot_product = sum(value_a * value_b for value_a, value_b in zip(vector_a, vector_b))
+    norm_a = math.sqrt(sum(value * value for value in vector_a))
+    norm_b = math.sqrt(sum(value * value for value in vector_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot_product / (norm_a * norm_b)
+
+
+def retrieve_relevant_chunks_hybrid(
+    question: str,
+    chunk_records: list[dict[str, object]],
+    embedding_vectors: dict[str, list[float]],
+    query_vector: list[float],
+    top_k: int = 3,
+    lexical_weight: float = 0.45,
+    semantic_weight: float = 0.55,
+    min_semantic_score: float = 0.1,
+) -> list[RetrievedChunk]:
+    """基于关键词分数和向量相似度执行混合检索。
+
+    输入：
+        question: 用户问题文本。
+        chunk_records: 已构建的知识库文本块记录列表。
+        embedding_vectors: chunk_id 到向量的映射。
+        query_vector: 用户问题的向量。
+        top_k: 最多返回多少条结果。
+        lexical_weight: 关键词分数权重。
+        semantic_weight: 向量分数权重。
+        min_semantic_score: 最低向量相似度阈值。
+    输出：
+        按混合相关性排序的检索结果列表。
+    异常：
+        当问题为空时，抛出 ValueError。
+    """
+
+    if not question or not question.strip():
+        raise ValueError("问题不能为空。")
+
+    lexical_results = retrieve_relevant_chunks(
+        question=question,
+        chunk_records=chunk_records,
+        top_k=max(top_k * 4, 12),
+        min_score=0.0,
+    )
+    lexical_score_map = {item.chunk_id: item.score for item in lexical_results}
+    lexical_term_map = {item.chunk_id: item.matched_terms for item in lexical_results}
+
+    scored_chunks: list[RetrievedChunk] = []
+    for chunk_record in chunk_records:
+        chunk_id = str(chunk_record.get("chunk_id", ""))
+        chunk_vector = embedding_vectors.get(chunk_id, [])
+        semantic_score = cosine_similarity(query_vector, chunk_vector)
+        lexical_score = lexical_score_map.get(chunk_id, 0.0)
+        normalized_lexical_score = min(lexical_score / 20.0, 1.0)
+        hybrid_score = normalized_lexical_score * lexical_weight + semantic_score * semantic_weight
+
+        if semantic_score < min_semantic_score and lexical_score <= 0:
+            continue
+
+        metadata = chunk_record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        chunk_text = str(chunk_record.get("text", ""))
+        matched_terms = lexical_term_map.get(chunk_id, [])
+        scored_chunks.append(
+            RetrievedChunk(
+                chunk_id=chunk_id,
+                document_id=str(chunk_record.get("document_id", "")),
+                text=chunk_text,
+                snippet=build_chunk_snippet(chunk_text, matched_terms),
+                score=hybrid_score,
                 matched_terms=matched_terms,
                 metadata=metadata,
             )

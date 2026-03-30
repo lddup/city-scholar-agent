@@ -6,7 +6,16 @@ from pathlib import Path
 from typing import Any
 
 from config import get_app_config
-from core.agent import AgentAnswer, CityScholarAgent, KnowledgeBaseState, PaperAnalysisResponse
+from core.agent import (
+    AgentAnswer,
+    CityScholarAgent,
+    EmbeddingIndexResponse,
+    KnowledgeBaseState,
+    PaperAnalysisResponse,
+    PaperComparisonResponse,
+    ReviewOutlineResponse,
+    WorkflowResponse,
+)
 from llm_dashscope import DashScopeClient, parse_first_json_object
 from tools.analyze_tool import StructuredPaperAnalysis, format_analysis_result
 
@@ -24,11 +33,13 @@ def initialize_llm_client(config: dict[str, Path | str | int | bool]) -> DashSco
     api_key = str(config.get("dashscope_api_key", "")).strip()
     base_url = str(config.get("dashscope_base_url", "")).strip()
     timeout_sec = int(config.get("dashscope_timeout_sec", 45))
+    # 未配置 API Key 时保持“纯本地规则模式”，避免启动时报错中断。
     if not api_key:
         return None
     try:
         return DashScopeClient(api_key=api_key, base_url=base_url, timeout_sec=timeout_sec)
     except Exception:
+        # 初始化失败时不抛出异常，回退到本地规则模式继续可用。
         return None
 
 
@@ -36,6 +47,7 @@ def show_startup_info(
     config: dict[str, Path | str | int | bool],
     knowledge_base: KnowledgeBaseState,
     llm_client: DashScopeClient | None,
+    embedding_status: EmbeddingIndexResponse | None,
 ) -> None:
     """输出启动信息。"""
 
@@ -55,13 +67,26 @@ def show_startup_info(
     if llm_enabled:
         print(f"问答模型：{answer_model}")
         print(f"分析模型：{analysis_model}")
-    print("当前模式：命令行最小检索、问答与单篇论文结构化分析。")
+        print(f"向量模型：{config['dashscope_embedding_model']}")
+    if embedding_status is not None:
+        print(f"向量索引：{embedding_status.status_message}")
+        if embedding_status.vector_count > 0:
+            print(f"向量数量：{embedding_status.vector_count}")
+    print("当前模式：命令行最小检索、混合检索问答、单篇分析、多篇比较、综述提纲与多步工作流。")
     print("可用命令：")
-    print("- 直接输入问题：执行检索问答（启用大模型时自动增强）")
+    print("- 直接输入问题：执行检索问答（若已构建向量索引，则自动走混合检索）")
+    print("- build_index：构建第四周本地向量索引")
+    print("- rebuild_index：强制重建本地向量索引")
     print("- papers：查看当前可分析论文列表")
     print("- analyze：分析第一篇论文（启用大模型时自动增强）")
     print("- analyze 1：按序号分析论文")
     print("- analyze 文件名关键词：按文件名或文档编号分析论文")
+    print("- compare：比较前两篇论文")
+    print("- compare 1,2：比较指定论文")
+    print("- outline 城市韧性研究综述：生成最小综述提纲")
+    print("- outline 1,2,3 :: 城市韧性研究综述：基于指定论文生成提纲")
+    print("- workflow 城市韧性研究综述：执行多步工作流（比较 -> 提纲 -> 导出）")
+    print("- workflow 1,2,3 :: 城市韧性研究综述：基于指定论文执行多步工作流")
     print("- help：再次查看命令说明")
     print("- exit：退出程序")
     print("=" * 60)
@@ -92,6 +117,7 @@ def build_answer_context(result: AgentAnswer) -> str:
 
     context_lines: list[str] = []
     for index, source in enumerate(result.sources, start=1):
+        # 将来源信息统一格式化，方便模型按来源编号引用证据。
         page_text = format_page_numbers(source.get("page_numbers", []))
         file_name = str(source.get("file_name", "未知论文"))
         snippet = str(source.get("snippet", ""))
@@ -106,6 +132,7 @@ def enhance_answer_with_llm(
 ) -> tuple[AgentAnswer, str | None]:
     """在已有检索结果基础上，使用大模型增强回答文本。"""
 
+    # 没有模型或没有来源证据时，不进行增强，保持最小闭环稳定。
     if client is None:
         return result, None
     if not result.sources:
@@ -162,6 +189,7 @@ def build_analysis_input_for_llm(full_text: str, max_chars: int = 18000) -> str:
     if len(text) <= max_chars:
         return text
 
+    # 文本过长时保留前后文，兼顾背景信息与结论信息。
     head = text[: int(max_chars * 0.65)]
     tail = text[-int(max_chars * 0.35) :]
     return f"{head}\n\n[...中间内容已省略...]\n\n{tail}"
@@ -195,6 +223,7 @@ def normalize_evidence_map(data: dict[str, Any]) -> dict[str, list[str]]:
 
     for field_key in field_keys:
         raw_value = raw_map.get(field_key, [])
+        # 兼容模型可能返回的字符串或列表两种结构，统一为字符串列表。
         if isinstance(raw_value, list):
             normalized_list = [str(item).strip() for item in raw_value if str(item).strip()]
         elif isinstance(raw_value, str):
@@ -259,6 +288,7 @@ def enhance_analysis_with_llm(
         return base_result, "学术分析大模型输出非 JSON，已回退规则分析。"
 
     fallback_analysis = base_result.analysis
+    # 逐字段合并：模型有值就用模型值，缺失时回退规则提取结果。
     merged_analysis = StructuredPaperAnalysis(
         file_name=fallback_analysis.file_name,
         document_id=fallback_analysis.document_id,
@@ -310,6 +340,40 @@ def display_analysis(result: PaperAnalysisResponse) -> None:
     print(result.formatted_output)
 
 
+def display_comparison(result: PaperComparisonResponse) -> None:
+    """以命令行方式展示多篇论文比较结果。"""
+
+    print("\n多篇比较：")
+    print(result.status_message)
+    print(result.formatted_output)
+
+
+def display_outline(result: ReviewOutlineResponse) -> None:
+    """以命令行方式展示综述提纲生成结果。"""
+
+    print("\n综述提纲：")
+    print(result.status_message)
+    print(result.formatted_output)
+
+
+def display_workflow(result: WorkflowResponse) -> None:
+    """以命令行方式展示多步工作流执行结果。"""
+
+    print("\n多步工作流：")
+    print(result.status_message)
+    print(result.formatted_output)
+
+
+def display_embedding_index_status(result: EmbeddingIndexResponse) -> None:
+    """以命令行方式展示向量索引状态。"""
+
+    print("\n向量索引：")
+    print(result.status_message)
+    print(f"索引路径：{result.index_path}")
+    print(f"向量数量：{result.vector_count}")
+    print(f"是否缓存加载：{'是' if result.loaded_from_cache else '否'}")
+
+
 def display_paper_list(agent: CityScholarAgent) -> None:
     """展示当前可用论文列表。"""
 
@@ -330,11 +394,19 @@ def show_cli_help() -> None:
     """输出命令行帮助信息。"""
 
     print("\n命令说明：")
-    print("- 直接输入问题：执行论文检索问答")
+    print("- 直接输入问题：执行论文检索问答（若已构建向量索引，则自动走混合检索）")
+    print("- build_index：构建本地向量索引")
+    print("- rebuild_index：强制重建本地向量索引")
     print("- papers：查看论文列表")
     print("- analyze：分析第一篇论文")
     print("- analyze 1：分析第 1 篇论文")
     print("- analyze 关键词：按文件名或文档编号模糊匹配分析")
+    print("- compare：比较前两篇论文")
+    print("- compare 1,2：比较指定论文")
+    print("- outline 主题：基于默认论文生成综述提纲")
+    print("- outline 1,2,3 :: 主题：基于指定论文生成综述提纲")
+    print("- workflow 主题：基于默认论文执行多步工作流")
+    print("- workflow 1,2,3 :: 主题：基于指定论文执行多步工作流")
     print("- help：查看帮助")
     print("- exit：退出程序")
 
@@ -348,11 +420,57 @@ def parse_analyze_target(user_input: str) -> str | None:
     return parts[1].strip() or None
 
 
+def parse_target_list(target_text: str) -> list[str]:
+    """将命令中的目标论文文本解析为目标列表。"""
+
+    cleaned_text = target_text.replace("，", ",").strip()
+    if not cleaned_text:
+        return []
+    if "," in cleaned_text:
+        return [item.strip() for item in cleaned_text.split(",") if item.strip()]
+    return [item.strip() for item in cleaned_text.split() if item.strip()]
+
+
+def parse_compare_targets(user_input: str) -> list[str] | None:
+    """从 compare 命令中解析目标论文列表。"""
+
+    parts = user_input.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    targets = parse_target_list(parts[1])
+    return targets or None
+
+
+def parse_outline_request(user_input: str) -> tuple[list[str] | None, str]:
+    """从 outline 命令中解析目标论文列表与综述主题。"""
+
+    parts = user_input.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None, ""
+
+    payload = parts[1].strip()
+    if "::" not in payload:
+        return None, payload
+
+    target_text, topic = payload.split("::", maxsplit=1)
+    targets = parse_target_list(target_text)
+    return (targets or None), topic.strip()
+
+
+def parse_workflow_request(user_input: str) -> tuple[list[str] | None, str]:
+    """从 workflow 命令中解析目标论文列表与工作流主题。"""
+
+    return parse_outline_request(user_input)
+
+
 def run_cli_chat(
     agent: CityScholarAgent,
     llm_client: DashScopeClient | None,
     answer_model: str,
     analysis_model: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+    processed_data_dir: Path,
 ) -> None:
     """启动命令行交互循环。"""
 
@@ -386,7 +504,42 @@ def run_cli_chat(
                 print(f"读取论文列表失败：{exc}")
             continue
 
+        if normalized_input in {"build_index", "index"}:
+            try:
+                embedding_result = agent.prepare_embedding_index(
+                    client=llm_client,
+                    model_name=embedding_model,
+                    dimensions=embedding_dimensions,
+                    processed_data_dir=processed_data_dir,
+                    build_if_missing=True,
+                    force_rebuild=False,
+                )
+            except Exception as exc:
+                print(f"向量索引构建失败：{exc}")
+                continue
+
+            display_embedding_index_status(embedding_result)
+            continue
+
+        if normalized_input == "rebuild_index":
+            try:
+                embedding_result = agent.prepare_embedding_index(
+                    client=llm_client,
+                    model_name=embedding_model,
+                    dimensions=embedding_dimensions,
+                    processed_data_dir=processed_data_dir,
+                    build_if_missing=True,
+                    force_rebuild=True,
+                )
+            except Exception as exc:
+                print(f"向量索引重建失败：{exc}")
+                continue
+
+            display_embedding_index_status(embedding_result)
+            continue
+
         if normalized_input.startswith("analyze") or user_input.startswith("分析"):
+            # 分析命令支持：默认第一篇、序号、关键词三种入口。
             analyze_target = parse_analyze_target(user_input)
             try:
                 analysis_result, warning = enhance_analysis_with_llm(
@@ -404,7 +557,64 @@ def run_cli_chat(
             display_analysis(analysis_result)
             continue
 
+        if normalized_input.startswith("compare") or user_input.startswith("对比"):
+            compare_targets = parse_compare_targets(user_input)
+            try:
+                comparison_result = agent.compare_papers(compare_targets)
+            except ValueError as exc:
+                print(f"多篇比较输入有误：{exc}")
+                continue
+            except Exception as exc:
+                print(f"多篇比较过程出现异常：{exc}")
+                continue
+
+            display_comparison(comparison_result)
+            continue
+
+        if normalized_input.startswith("outline") or user_input.startswith("提纲"):
+            outline_targets, outline_topic = parse_outline_request(user_input)
+            if not outline_topic:
+                print("请输入综述主题，例如：outline 城市韧性研究综述")
+                continue
+
+            try:
+                outline_result = agent.generate_review_outline(
+                    topic=outline_topic,
+                    targets=outline_targets,
+                )
+            except ValueError as exc:
+                print(f"综述提纲输入有误：{exc}")
+                continue
+            except Exception as exc:
+                print(f"综述提纲生成过程出现异常：{exc}")
+                continue
+
+            display_outline(outline_result)
+            continue
+
+        if normalized_input.startswith("workflow") or user_input.startswith("流程"):
+            workflow_targets, workflow_topic = parse_workflow_request(user_input)
+            if not workflow_topic:
+                print("请输入工作流主题，例如：workflow 城市韧性研究综述")
+                continue
+
+            try:
+                workflow_result = agent.run_review_workflow(
+                    topic=workflow_topic,
+                    targets=workflow_targets,
+                )
+            except ValueError as exc:
+                print(f"多步工作流输入有误：{exc}")
+                continue
+            except Exception as exc:
+                print(f"多步工作流执行过程出现异常：{exc}")
+                continue
+
+            display_workflow(workflow_result)
+            continue
+
         try:
+            # 普通输入按问答处理：先本地检索，再按配置进行大模型增强。
             answer_result = agent.answer(user_input)
             answer_result, warning = enhance_answer_with_llm(answer_result, llm_client, answer_model)
         except ValueError as exc:
@@ -423,6 +633,7 @@ def main() -> None:
     """运行命令行主入口。"""
 
     config = get_app_config()
+    # 启动时先确保基础目录存在，避免后续读写路径失败。
     ensure_directories(
         [
             config["data_dir"],
@@ -435,6 +646,8 @@ def main() -> None:
     llm_client = initialize_llm_client(config)
     answer_model = str(config.get("dashscope_answer_model", "qwen-plus"))
     analysis_model = str(config.get("dashscope_analysis_model", "qwen-max"))
+    embedding_model = str(config.get("dashscope_embedding_model", "text-embedding-v3"))
+    embedding_dimensions = int(config.get("dashscope_embedding_dimensions", 128))
 
     agent = CityScholarAgent(raw_papers_dir=config["raw_papers_dir"])
     try:
@@ -446,7 +659,26 @@ def main() -> None:
         print(f"知识库构建失败：{exc}")
         return
 
-    show_startup_info(config, knowledge_base, llm_client)
+    embedding_status: EmbeddingIndexResponse | None = None
+    if llm_client is not None and knowledge_base.chunk_records:
+        try:
+            embedding_status = agent.prepare_embedding_index(
+                client=llm_client,
+                model_name=embedding_model,
+                dimensions=embedding_dimensions,
+                processed_data_dir=config["processed_data_dir"],
+                build_if_missing=False,
+                force_rebuild=False,
+            )
+        except Exception as exc:
+            embedding_status = EmbeddingIndexResponse(
+                status_message=f"向量索引初始化失败：{exc}",
+                index_path="",
+                vector_count=0,
+                loaded_from_cache=False,
+            )
+
+    show_startup_info(config, knowledge_base, llm_client, embedding_status)
     show_parse_error_summary(knowledge_base.parse_errors)
 
     if not knowledge_base.pdf_files:
@@ -467,6 +699,9 @@ def main() -> None:
         llm_client=llm_client,
         answer_model=answer_model,
         analysis_model=analysis_model,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        processed_data_dir=config["processed_data_dir"],
     )
 
 

@@ -1,4 +1,4 @@
-"""本模块作用：提供 DashScope 兼容接口的大模型调用能力，并封装常用的 JSON 解析辅助函数。"""
+﻿"""本模块作用：提供 DashScope 兼容接口的大模型调用能力，并封装常用的 JSON 解析辅助函数。"""
 
 from __future__ import annotations
 
@@ -56,6 +56,7 @@ class DashScopeClient:
             当请求失败或响应解析失败时，抛出 RuntimeError。
         """
 
+        # 组装与 OpenAI 兼容的最小请求体，便于后续替换模型服务。
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -81,6 +82,7 @@ class DashScopeClient:
             with urlopen(request, timeout=self.timeout_sec) as response:
                 raw_text = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
+            # 保留服务端返回片段，便于快速定位鉴权、限流或参数错误。
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"DashScope 请求失败（HTTP {exc.code}）：{body[:200]}") from exc
         except URLError as exc:
@@ -90,6 +92,7 @@ class DashScopeClient:
 
         try:
             response_data = json.loads(raw_text)
+            # 兼容标准 chat.completions 结构：choices[0].message.content。
             choices = response_data.get("choices", [])
             if not choices:
                 raise ValueError("响应中缺少 choices。")
@@ -99,6 +102,73 @@ class DashScopeClient:
             return content.strip()
         except Exception as exc:
             raise RuntimeError(f"DashScope 响应解析失败：{raw_text[:200]}") from exc
+
+    def embed_texts(
+        self,
+        *,
+        model: str,
+        texts: list[str],
+        dimensions: int | None = None,
+    ) -> list[list[float]]:
+        """调用向量化接口并返回文本向量列表。
+
+        输入：
+            model: 向量模型名称。
+            texts: 待向量化的文本列表。
+            dimensions: 可选，向量维度。
+        输出：
+            与输入文本一一对应的向量列表。
+        异常：
+            当请求失败或响应解析失败时，抛出 RuntimeError。
+        """
+
+        if not texts:
+            return []
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": texts,
+        }
+        if dimensions is not None and dimensions > 0:
+            payload["dimensions"] = dimensions
+
+        endpoint = f"{self.base_url}/embeddings"
+        request = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=self.timeout_sec) as response:
+                raw_text = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"DashScope 向量请求失败（HTTP {exc.code}）：{body[:200]}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"DashScope 向量网络请求失败：{exc.reason}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"DashScope 向量调用异常：{exc}") from exc
+
+        try:
+            response_data = json.loads(raw_text)
+            data_items = response_data.get("data", [])
+            if not isinstance(data_items, list) or not data_items:
+                raise ValueError("响应中缺少 data。")
+
+            embeddings: list[list[float]] = []
+            for item in data_items:
+                embedding = item.get("embedding", [])
+                if not isinstance(embedding, list) or not embedding:
+                    raise ValueError("响应中缺少有效 embedding。")
+                embeddings.append([float(value) for value in embedding])
+            return embeddings
+        except Exception as exc:
+            raise RuntimeError(f"DashScope 向量响应解析失败：{raw_text[:200]}") from exc
 
 
 def parse_first_json_object(text: str) -> dict[str, Any] | None:
@@ -116,7 +186,7 @@ def parse_first_json_object(text: str) -> dict[str, Any] | None:
     if not cleaned_text:
         return None
 
-    # 先尝试直接按 JSON 解析。
+    # 优先直接解析，适配 response_format=json_object 场景。
     try:
         direct_value = json.loads(cleaned_text)
         if isinstance(direct_value, dict):
@@ -124,7 +194,7 @@ def parse_first_json_object(text: str) -> dict[str, Any] | None:
     except Exception:
         pass
 
-    # 再从文本中提取第一个大括号对象。
+    # 若模型混入解释文本，再兜底提取首个 JSON 对象。
     match = re.search(r"\{[\s\S]*\}", cleaned_text)
     if not match:
         return None
@@ -136,3 +206,4 @@ def parse_first_json_object(text: str) -> dict[str, Any] | None:
     except Exception:
         return None
     return None
+
